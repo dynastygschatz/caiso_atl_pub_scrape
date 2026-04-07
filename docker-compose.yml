@@ -1,26 +1,37 @@
 version: "3.9"
 
+# ── Shared config ──────────────────────────────────────────────────────────────
+x-common: &common
+  build: .
+  image: caiso-atl-pub:latest
+  restart: unless-stopped
+  volumes:
+    - /opt/caiso-scraper/credentials.json:/app/credentials.json:ro
+  environment:
+    PYTHONUNBUFFERED: "1"
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+# ── Services ───────────────────────────────────────────────────────────────────
 services:
-  caiso-scraper:
-    build: .
-    image: caiso-atl-pub-scraper:latest
-    container_name: caiso-atl-pub-scraper
-    restart: unless-stopped
 
-    volumes:
-      # Mount credentials from the host — never copy secrets into the image
-      - /opt/caiso-scraper/credentials.json:/app/credentials.json:ro
-
-    environment:
-      # Python output unbuffered so logs show in real time
-      PYTHONUNBUFFERED: "1"
-
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "5"
-
-    # Optional: resource limits appropriate for a lightweight scraper
+  # Fetches from OASIS every 60 s and populates the queue
+  caiso-fetcher:
+    <<: *common
+    container_name: caiso-fetcher
+    command: python -u scraper.py
     mem_limit: 256m
     cpus: "0.5"
+
+  # Drains the queue sequentially — completely independent of the fetcher
+  caiso-queue-worker:
+    <<: *common
+    container_name: caiso-queue-worker
+    command: python -u queue_worker.py
+    mem_limit: 512m      # sub-scrapes may need more headroom
+    cpus: "1.0"
+    depends_on:
+      - caiso-fetcher    # start order only — no health-check dependency
