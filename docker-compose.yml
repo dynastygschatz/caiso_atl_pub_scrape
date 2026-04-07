@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  caiso-scraper:
+    build: .
+    image: caiso-atl-pub-scraper:latest
+    container_name: caiso-atl-pub-scraper
+    restart: unless-stopped
+
+    volumes:
+      # Mount credentials from the host — never copy secrets into the image
+      - /opt/caiso-scraper/credentials.json:/app/credentials.json:ro
+
+    environment:
+      # Python output unbuffered so logs show in real time
+      PYTHONUNBUFFERED: "1"
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    # Optional: resource limits appropriate for a lightweight scraper
+    mem_limit: 256m
+    cpus: "0.5"
