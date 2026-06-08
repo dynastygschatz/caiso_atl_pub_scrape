@@ -82,7 +82,12 @@ CREATE INDEX IF NOT EXISTS idx_scrape_queue_pending
 
 
 -- ── 5. Surface priority in the monitoring views ──────────────────────────────
-CREATE OR REPLACE VIEW west_fin.v_scrape_queue_stuck AS
+-- CREATE OR REPLACE can only append columns, not insert priority mid-list,
+-- so drop and recreate. (CASCADE not needed — nothing depends on these views.)
+DROP VIEW IF EXISTS west_fin.v_scrape_queue_stuck;
+DROP VIEW IF EXISTS west_fin.v_scrape_queue_failed;
+
+CREATE VIEW west_fin.v_scrape_queue_stuck AS
 SELECT
     queue_id,
     priority,
@@ -101,7 +106,7 @@ WHERE status = 'running'
   AND started_at < now() - INTERVAL '10 minutes'
 ORDER BY started_at;
 
-CREATE OR REPLACE VIEW west_fin.v_scrape_queue_failed AS
+CREATE VIEW west_fin.v_scrape_queue_failed AS
 SELECT
     queue_id,
     priority,
