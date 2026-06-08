@@ -94,12 +94,14 @@ def claim_next_job(conn) -> dict | None:
     """
     with conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Claim priority 1 before 2 before 3 (unset → 3), FIFO within a priority.
             cur.execute("""
                 SELECT *
                 FROM west_fin.scrape_queue
                 WHERE status = 'pending'
                   AND attempt_count < max_attempts
-                ORDER BY queued_at
+                  and now() > coalesce(rescrape_target_time, '1900-01-01'::timestamp)::timestamp
+                ORDER BY COALESCE(priority, 3), queued_at
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             """)
@@ -135,6 +137,7 @@ def mark_job_failed_or_retry(conn, queue_id: int, error: str) -> None:
     """
     with conn:
         with conn.cursor() as cur:
+            # Exponential backoff: 5 min, then 10, 20, 40, … per attempt.
             cur.execute("""
                 UPDATE west_fin.scrape_queue
                 SET status     = CASE
@@ -142,6 +145,8 @@ def mark_job_failed_or_retry(conn, queue_id: int, error: str) -> None:
                                    ELSE 'pending'
                                  END,
                     last_error = %s,
+                    rescrape_target_time = now()
+                        + ((5 * power(2, attempt_count - 1))::int || ' minutes')::interval,
                     started_at = NULL
                 WHERE queue_id = %s
             """, (error[:2000], queue_id))

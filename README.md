@@ -19,7 +19,8 @@ caiso-scraper/
 └── migrations/
     ├── 001_create_scrape_queue.sql   # Queue table + dedup indexes
     ├── 002_queue_health_view.sql     # Monitoring views + requeue helper
-    └── 003_stuck_job_recovery.sql    # Stuck-job recovery function
+    ├── 003_stuck_job_recovery.sql    # Stuck-job recovery function
+    └── 004_add_priority.sql          # Job priority → retry budget + claim order
 ```
 
 ---
@@ -148,12 +149,34 @@ SELECT west_fin.recover_stuck_jobs(5);     -- stricter 5-minute threshold
 
 The worker runs `recover_stuck_jobs()` automatically every 5 minutes. Any job
 that has been `running` for more than 10 minutes is reset to `pending` for
-retry (or permanently `failed` if it has hit `max_attempts = 3`). The
+retry (or permanently `failed` if it has hit `max_attempts`, which is derived
+from the job's priority — see **Job priority**). The
 `last_error` column records exactly when and why the reset happened.
 
 If your RDS instance has `pg_cron` enabled, `003_stuck_job_recovery.sql`
 contains a commented-out `cron.schedule()` call that adds a DB-side sweep as
 a second layer of protection.
+
+---
+
+## Job priority
+
+Each `scrape_queue` row carries a `priority` of 1–3 (1 = highest, default 3).
+Priority controls two things:
+
+- **Retry budget** — A trigger sets `max_attempts` from priority: **P1 → 10,
+  P2 → 5, P3 (or unset) → 3**. Change a job's priority and its retry budget is
+  re-derived automatically.
+- **Claim order** — The worker claims `ORDER BY priority, queued_at`, so every
+  pending priority-1 job is taken before any priority-2, and so on; jobs of the
+  same priority are still FIFO.
+
+`scraper.py` enqueues at the default priority (`DEFAULT_PRIORITY = 3`); set the
+`priority` column to 1 or 2 to fast-track a job.
+
+Between retries the worker applies **exponential backoff** via
+`rescrape_target_time`: 5 min after the first failure, then 10, 20, 40, …
+The job is not eligible to be re-claimed until that time has passed.
 
 ---
 
@@ -174,12 +197,15 @@ a second layer of protection.
 ## How the worker works (queue_worker.py)
 
 1. **Stuck-job sweep** — Calls `recover_stuck_jobs()` every 5 minutes.
-2. **Claim** — `SELECT … FOR UPDATE SKIP LOCKED` atomically grabs the oldest
-   pending job and flips it to `running`. Safe across container restarts.
+2. **Claim** — `SELECT … FOR UPDATE SKIP LOCKED` atomically grabs the
+   highest-priority pending job (`ORDER BY priority, queued_at`) whose
+   `rescrape_target_time` has passed, and flips it to `running`. Safe across
+   container restarts.
 3. **Dispatch** — Runs `sys_string` as a shell subprocess with a 5-minute
    timeout.
-4. **Result** — Exit 0 → `done`. Non-zero / timeout → `pending` for retry, or
-   `failed` after 3 attempts. Full error saved in `last_error`.
+4. **Result** — Exit 0 → `done`. Non-zero / timeout → `pending` for retry (with
+   exponential backoff), or `failed` once attempts hit the priority-derived
+   `max_attempts`. Full error saved in `last_error`.
 5. **Poll** — Sleeps 10 seconds between empty-queue checks.
 
 ---

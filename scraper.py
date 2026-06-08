@@ -39,7 +39,9 @@ CRED_SECTION     = "sandbox_su"
 PST              = pytz.timezone("America/Los_Angeles")
 MIN_LOOP_SECONDS = 60
 OASIS_URL        = "http://oasis.caiso.com/oasisapi/SingleZip"
-MAX_ATTEMPTS     = 3   # passed to scrape_queue rows at enqueue time
+DEFAULT_PRIORITY = 3   # scrape_queue priority for enqueued jobs (1=high … 3=low).
+                       # priority drives the retry budget (max_attempts) via a
+                       # DB trigger: P1=10, P2=5, P3=3.
 
 
 # ── Credentials / connection ───────────────────────────────────────────────────
@@ -272,7 +274,7 @@ def upsert_data(conn, rows: list[dict]) -> datetime:
                 INSERT INTO west_fin.scrape_queue
                     (sys_string, report_name, market_run_id,
                      opr_dt, opr_hr, opr_interval, source_posted_at,
-                     status, attempt_count, max_attempts)
+                     status, attempt_count, priority)
                 SELECT
                     a.sys_string,
                     a.report_name,
@@ -283,7 +285,7 @@ def upsert_data(conn, rows: list[dict]) -> datetime:
                     a.source_posted_at,
                     'pending',
                     0,
-                    %(max_attempts)s
+                    %(priority)s
                 FROM (
                     SELECT
                         x.report_name,
@@ -307,7 +309,7 @@ def upsert_data(conn, rows: list[dict]) -> datetime:
                 ON CONFLICT (sys_string, source_posted_at)
                     WHERE status IN ('pending', 'running')
                 DO NOTHING;
-            """, {"posted_at": posted_at, "max_attempts": MAX_ATTEMPTS})
+            """, {"posted_at": posted_at, "priority": DEFAULT_PRIORITY})
             log.info("Enqueued %d sub-scrape job(s)", cur.rowcount)
 
     return posted_at
