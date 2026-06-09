@@ -39,8 +39,9 @@ CRED_SECTION     = "sandbox_su"
 PST              = pytz.timezone("America/Los_Angeles")
 MIN_LOOP_SECONDS = 60
 OASIS_URL        = "http://oasis.caiso.com/oasisapi/SingleZip"
-DEFAULT_PRIORITY = 3   # scrape_queue priority for enqueued jobs (1=high … 3=low).
-                       # priority drives the retry budget (max_attempts) via a
+DEFAULT_PRIORITY = 3   # Fallback priority when caiso_atl_pub_xref.priority is NULL.
+                       # Priority (1=high … 3=low) is read per-row from the xref
+                       # table and drives the retry budget (max_attempts) via a
                        # DB trigger: P1=10, P2=5, P3=3.
 
 
@@ -285,7 +286,7 @@ def upsert_data(conn, rows: list[dict]) -> datetime:
                     a.source_posted_at,
                     'pending',
                     0,
-                    %(priority)s
+                    a.priority
                 FROM (
                     SELECT
                         x.report_name,
@@ -294,6 +295,8 @@ def upsert_data(conn, rows: list[dict]) -> datetime:
                         d.opr_hr,
                         d.opr_interval,
                         d.posted_at AS source_posted_at,
+                        -- Priority comes from the xref row; default to 3 when NA.
+                        COALESCE(x.priority, %(default_priority)s) AS priority,
                         x.sys_string
                             || ' -m ' || x.market_run_id
                             || ' -d ' || d.opr_dt
@@ -309,7 +312,7 @@ def upsert_data(conn, rows: list[dict]) -> datetime:
                 ON CONFLICT (sys_string, source_posted_at)
                     WHERE status IN ('pending', 'running')
                 DO NOTHING;
-            """, {"posted_at": posted_at, "priority": DEFAULT_PRIORITY})
+            """, {"posted_at": posted_at, "default_priority": DEFAULT_PRIORITY})
             log.info("Enqueued %d sub-scrape job(s)", cur.rowcount)
 
     return posted_at
