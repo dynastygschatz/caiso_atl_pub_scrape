@@ -4,9 +4,7 @@ CAISO sub-scrape queue worker
 Runs as a separate Docker service alongside scraper.py.
 
 Responsibilities:
-  - Drain west_fin.scrape_queue with WORKERS concurrent workers each cycle
-    (each worker runs one subprocess at a time; SKIP LOCKED keeps them
-    from claiming the same job)
+  - Drain west_fin.scrape_queue sequentially (one subprocess at a time)
   - Recover stuck jobs (running > STUCK_THRESHOLD_MINUTES) at startup
     and every STUCK_CHECK_INTERVAL_SECONDS thereafter
   - Sleep between polls so an empty queue doesn't busy-spin
@@ -20,6 +18,7 @@ This worker owns:
   - Everything after that (claiming, executing, marking done/failed/retry)
 """
 
+import os
 import json
 import time
 import logging
@@ -27,44 +26,21 @@ import subprocess
 import shlex
 import psycopg2
 import psycopg2.extras
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-# ── Logging ────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
-log = logging.getLogger("queue_worker")
+from west_utils.create_connection import create_connection
+from west_utils.misc_helper import initialize_logging
+
+abspath = os.path.abspath(path=__file__)
+dname = os.path.dirname(abspath)
+
+log = initialize_logging(default_log_filepath=f'{dname}/logs/scrape_queue.log')
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-CREDENTIALS_FILE        = "/app/credentials.json"
-CRED_SECTION            = "sandbox_su"
-WORKERS                 = 3      # concurrent workers launched each drain cycle
 SUBPROCESS_TIMEOUT      = 300    # seconds before a sub-scrape is killed
 POLL_INTERVAL_SECONDS   = 10     # how long to sleep when queue is empty
 STUCK_THRESHOLD_MINUTES = 10     # jobs running longer than this are recovered
 STUCK_CHECK_INTERVAL    = 300    # run stuck-job sweep every N seconds (5 min)
-
-
-# ── Credentials / connection ───────────────────────────────────────────────────
-
-def load_credentials() -> dict:
-    with open(CREDENTIALS_FILE) as f:
-        creds = json.load(f)
-    return creds[CRED_SECTION]
-
-
-def get_connection(creds: dict):
-    return psycopg2.connect(
-        host=creds["server"],
-        dbname=creds["database"],
-        port=int(creds["port"]),
-        user=creds["user"],
-        password=creds["password"],
-    )
-
 
 # ── Stuck-job recovery ─────────────────────────────────────────────────────────
 
@@ -98,14 +74,12 @@ def claim_next_job(conn) -> dict | None:
     """
     with conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Claim priority 1 before 2 before 3 (unset → 3), FIFO within a priority.
             cur.execute("""
                 SELECT *
                 FROM west_fin.scrape_queue
                 WHERE status = 'pending'
                   AND attempt_count < max_attempts
-                  and now() > coalesce(rescrape_target_time, '1900-01-01'::timestamp)::timestamp
-                ORDER BY COALESCE(priority, 3), queued_at
+                ORDER BY CASE market_run_id WHEN 'DAM' THEN 1 ELSE 2 END, source_posted_at
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             """)
@@ -141,7 +115,6 @@ def mark_job_failed_or_retry(conn, queue_id: int, error: str) -> None:
     """
     with conn:
         with conn.cursor() as cur:
-            # Exponential backoff: 5 min, then 10, 20, 40, … per attempt.
             cur.execute("""
                 UPDATE west_fin.scrape_queue
                 SET status     = CASE
@@ -149,8 +122,6 @@ def mark_job_failed_or_retry(conn, queue_id: int, error: str) -> None:
                                    ELSE 'pending'
                                  END,
                     last_error = %s,
-                    rescrape_target_time = now()
-                        + ((5 * power(2, attempt_count - 1))::int || ' minutes')::interval,
                     started_at = NULL
                 WHERE queue_id = %s
             """, (error[:2000], queue_id))
@@ -209,77 +180,43 @@ def run_job(conn, job: dict) -> None:
         mark_job_failed_or_retry(conn, qid, err)
 
 
-# ── Concurrent worker ────────────────────────────────────────────────────────
-
-def worker_drain(creds: dict, worker_id: int) -> int:
-    """
-    One concurrent worker: opens its OWN DB connection and claims+runs jobs
-    until the queue has nothing left to give it, then returns how many it ran.
-
-    Each worker must have its own connection — psycopg2 connections are not safe
-    to share across threads — and `SELECT … FOR UPDATE SKIP LOCKED` in
-    claim_next_job guarantees two workers never grab the same job.
-    """
-    processed = 0
-    try:
-        conn = get_connection(creds)
-    except psycopg2.OperationalError as exc:
-        log.error("worker %d: could not connect: %s", worker_id, exc)
-        return 0
-
-    try:
-        while True:
-            job = claim_next_job(conn)
-            if job is None:
-                break
-            run_job(conn, job)
-            processed += 1
-    except Exception as exc:
-        log.exception("worker %d: error while draining: %s", worker_id, exc)
-    finally:
-        conn.close()
-
-    return processed
-
-
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("Queue worker starting (%d concurrent worker(s))", WORKERS)
-    creds = load_credentials()
+    log.info("Queue worker starting")
+    # creds = load_credentials()
 
     last_stuck_check = 0.0   # force an immediate check on startup
 
     while True:
         try:
-            # ── Stuck-job recovery (periodic) ──────────────────────────────────
-            now = time.time()
-            if now - last_stuck_check >= STUCK_CHECK_INTERVAL:
-                conn = get_connection(creds)
-                try:
+            conn = create_connection(conn_name='sandbox')
+            try:
+                # ── Stuck-job recovery (periodic) ──────────────────────────────
+                now = time.time()
+                if now - last_stuck_check >= STUCK_CHECK_INTERVAL:
                     recover_stuck_jobs(conn)
-                finally:
-                    conn.close()
-                last_stuck_check = now
+                    last_stuck_check = now
 
-            # ── Drain pending jobs with WORKERS concurrent workers ─────────────
-            with ThreadPoolExecutor(
-                max_workers=WORKERS, thread_name_prefix="scrape-worker"
-            ) as pool:
-                futures = [pool.submit(worker_drain, creds, i) for i in range(WORKERS)]
-                drained = sum(f.result() for f in futures)
+                # ── Drain all pending jobs ─────────────────────────────────────
+                drained = 0
+                while True:
+                    job = claim_next_job(conn)
+                    if job is None:
+                        break
+                    run_job(conn, job)
+                    drained += 1
 
-            if drained:
-                conn = get_connection(creds)
-                try:
+                if drained:
                     summary = get_queue_summary(conn)
-                finally:
-                    conn.close()
-                log.info(
-                    "Drain complete — %d job(s) across %d worker(s) | queue: %s",
-                    drained, WORKERS,
-                    " | ".join(f"{k}={v}" for k, v in summary.items()) or "all clear"
-                )
+                    log.info(
+                        "Drain complete — %d job(s) processed | queue: %s",
+                        drained,
+                        " | ".join(f"{k}={v}" for k, v in summary.items()) or "all clear"
+                    )
+
+            finally:
+                conn.close()
 
         except psycopg2.OperationalError as exc:
             # DB connection dropped — log and retry after poll interval
